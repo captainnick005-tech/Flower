@@ -1,10 +1,14 @@
-name: Deploy SpaceRep
+name: Deploy to GitHub Pages
 
 on:
   push:
     branches:
       - main
-  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
 
 jobs:
   build-and-deploy:
@@ -28,21 +32,24 @@ jobs:
         run: pnpm install --no-frozen-lockfile
 
       - name: Build
+        working-directory: artifacts/spacerep
         run: pnpm run build:github
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: dist
+          path: artifacts/spacerep/dist
 
   deploy:
     needs: build-and-deploy
+    runs-on: ubuntu-latest
+
+    environment:
+      name: github-pages
+
     permissions:
       pages: write
       id-token: write
-    environment:
-      name: github-pages
-    runs-on: ubuntu-latest
 
     steps:
       - name: Deploy
