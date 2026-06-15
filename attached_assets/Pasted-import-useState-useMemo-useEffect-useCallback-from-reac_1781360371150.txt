@@ -1,0 +1,697 @@
+import { useState, useMemo, useEffect, useCallback } from "react";
+import * as XLSX from "xlsx";
+
+// â”€â”€â”€ Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const INTERVALS = [0, 1, 3, 7, 15, 30, 60, 90];
+const LABELS    = ["Same Day", "+1 Day", "+3 Days", "+7 Days", "+15 Days", "+30 Days", "+60 Days", "+90 Days"];
+
+const C = {
+  bg:       "#0b0d14",
+  card:     "#13161f",
+  surface:  "#1c1f2e",
+  border:   "#252840",
+  accent:   "#7c6fff",
+  accentDim:"#3d3880",
+  green:    "#34d399",
+  greenDim: "#064e3b",
+  yellow:   "#fbbf24",
+  yellowDim:"#451a03",
+  red:      "#f87171",
+  redDim:   "#450a0a",
+  blue:     "#60a5fa",
+  blueDim:  "#1e3a5f",
+  text:     "#e2e8f0",
+  muted:    "#64748b",
+  faint:    "#2a2d3a",
+};
+
+// â”€â”€â”€ Storage helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const STORAGE_KEY = "srs_planner_v2";
+const save = (data) => {
+  try { window.storage?.set(STORAGE_KEY, JSON.stringify(data), false); } catch {}
+  try { sessionStorage.setItem(STORAGE_KEY, JSON.stringify(data)); } catch {}
+};
+const load = () => {
+  try {
+    const raw = sessionStorage.getItem(STORAGE_KEY);
+    if (raw) return JSON.parse(raw);
+  } catch {}
+  return null;
+};
+
+// â”€â”€â”€ Schedule engine â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+function buildSchedule(totalDays, inputs, startDay) {
+  let lecNum = 1;
+  const studyDays = [];
+
+  for (let d = 1; d <= totalDays; d++) {
+    const raw = inputs[d];
+    const count = raw === undefined ? 2 : Math.max(0, parseInt(raw) || 0);
+    const lecs = [];
+    for (let i = 0; i < count; i++) lecs.push(lecNum++);
+    studyDays.push({ day: d, count, lecs });
+  }
+
+  const totalLectures = lecNum - 1;
+  const planEnd = totalDays + 90;
+
+  const revMap = {};
+  for (let d = 1; d <= planEnd; d++) revMap[d] = [];
+
+  for (const { day, lecs } of studyDays) {
+    for (const ln of lecs) {
+      for (let i = 0; i < INTERVALS.length; i++) {
+        const rd = day + INTERVALS[i];
+        if (rd <= planEnd) revMap[rd].push({ ln, iv: INTERVALS[i], ivLabel: LABELS[i], fromDay: day });
+      }
+    }
+  }
+
+  const allDays = [];
+  for (let d = 1; d <= planEnd; d++) {
+    const sd = studyDays[d - 1];
+    allDays.push({
+      day: d,
+      isStudy: d <= totalDays,
+      count: sd?.count ?? 0,
+      lecs: sd?.lecs ?? [],
+      revisions: revMap[d],
+    });
+  }
+
+  // "today" based on startDay offset
+  const todayRow = startDay >= 1 && startDay <= planEnd ? allDays[startDay - 1] : null;
+
+  return { allDays, totalLectures, planEnd, studyDays, todayRow };
+}
+
+// â”€â”€â”€ Date helpers â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+const toYMD = (date) => date.toISOString().slice(0, 10); // "YYYY-MM-DD"
+const todayYMD = () => toYMD(new Date());
+
+function dateForDay(startDateStr, dayNum) {
+  // dayNum is 1-based; Day 1 = startDate
+  if (!startDateStr) return null;
+  const d = new Date(startDateStr);
+  d.setDate(d.getDate() + dayNum - 1);
+  return d;
+}
+
+function formatDate(date) {
+  if (!date) return "";
+  return date.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", weekday: "short" });
+}
+
+function formatDateShort(date) {
+  if (!date) return "";
+  return date.toLocaleDateString("en-IN", { day: "numeric", month: "short", weekday: "short" });
+}
+
+// Given a startDate and today's real date, figure out which Day number it is
+function currentDayNum(startDateStr) {
+  if (!startDateStr) return 1;
+  const start = new Date(startDateStr);
+  const now = new Date();
+  start.setHours(0, 0, 0, 0);
+  now.setHours(0, 0, 0, 0);
+  const diff = Math.round((now - start) / 86400000) + 1;
+  return Math.max(1, diff);
+}
+
+// â”€â”€â”€ App â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+export default function App() {
+  const saved = load();
+  const [totalDays, setTotalDays]   = useState(saved?.totalDays ?? 20);
+  const [inputs, setInputs]         = useState(saved?.inputs ?? {});
+  const [startDate, setStartDate]   = useState(saved?.startDate ?? todayYMD()); // real calendar date of Day 1
+  const [startDay, setStartDay]     = useState(saved?.startDay ?? 1);
+  const [lectureNames, setLectureNames] = useState(saved?.lectureNames ?? {}); // ln -> name
+  const [done, setDone]             = useState(saved?.done ?? {}); // "day-ln-iv" -> bool
+  const [view, setView]             = useState("today");
+  const [notifTime, setNotifTime]   = useState(saved?.notifTime ?? "08:00");
+  const [notifEnabled, setNotifEnabled] = useState(saved?.notifEnabled ?? false);
+  const [toast, setToast]           = useState(null);
+  const [searchQ, setSearchQ]       = useState("");
+  const [editingName, setEditingName] = useState(null); // ln being renamed
+
+  // Auto-sync startDay to real calendar date when startDate is set
+  useEffect(() => {
+    if (startDate) {
+      const d = currentDayNum(startDate);
+      setStartDay(d);
+    }
+  }, [startDate]);
+
+  const sched = useMemo(() =>
+    buildSchedule(totalDays, inputs, startDay),
+    [totalDays, inputs, startDay]
+  );
+
+  // Persist
+  useEffect(() => {
+    save({ totalDays, inputs, startDay, startDate, lectureNames, done, notifTime, notifEnabled });
+  }, [totalDays, inputs, startDay, startDate, lectureNames, done, notifTime, notifEnabled]);
+
+  const showToast = (msg, color = C.green) => {
+    setToast({ msg, color });
+    setTimeout(() => setToast(null), 3000);
+  };
+
+  // Browser notification
+  const requestNotif = async () => {
+    if (!("Notification" in window)) { showToast("Notifications not supported", C.red); return; }
+    const perm = await Notification.requestPermission();
+    if (perm === "granted") {
+      setNotifEnabled(true);
+      showToast("Notifications enabled! ðŸ””");
+      scheduleNotif();
+    } else {
+      showToast("Permission denied", C.red);
+    }
+  };
+
+  const scheduleNotif = useCallback(() => {
+    if (!notifEnabled || !sched.todayRow) return;
+    const [h, m] = notifTime.split(":").map(Number);
+    const now = new Date();
+    const target = new Date();
+    target.setHours(h, m, 0, 0);
+    if (target <= now) target.setDate(target.getDate() + 1);
+    const ms = target - now;
+    setTimeout(() => {
+      const today = sched.todayRow;
+      const revCount = today.revisions.length;
+      const newCount = today.lecs.length;
+      new Notification("ðŸ“š Study Reminder", {
+        body: `Today (Day ${startDay}): ${newCount} new lecture${newCount !== 1 ? "s" : ""} + ${revCount} revision${revCount !== 1 ? "s" : ""} due.`,
+        icon: "https://em-content.zobj.net/source/apple/354/books_1f4da.png",
+      });
+    }, ms);
+  }, [notifEnabled, notifTime, sched.todayRow, startDay]);
+
+  useEffect(() => { if (notifEnabled) scheduleNotif(); }, [notifEnabled, notifTime, scheduleNotif]);
+
+  const toggleDone = (key) => setDone(prev => ({ ...prev, [key]: !prev[key] }));
+
+  const getLecName = (ln) => lectureNames[ln] || `Lecture ${ln}`;
+
+  const exportXLSX = () => {
+    const wb = XLSX.utils.book_new();
+    const rows = [["Day", "Date", "Lectures", "New Lectures", ...LABELS.map(l => `Revise (${l})`)]];
+    for (const row of sched.allDays) {
+      const d = dateForDay(startDate, row.day);
+      const dateStr = d ? d.toLocaleDateString("en-IN", { day: "numeric", month: "short", year: "numeric", weekday: "short" }) : "";
+      const newLecs = row.lecs.length ? row.lecs.map(n => getLecName(n)).join(", ") : row.count === 0 && row.isStudy ? "Holiday" : "â€”";
+      const revCols = INTERVALS.map(iv => {
+        const r = row.revisions.filter(r => r.iv === iv).map(r => getLecName(r.ln)).join(", ");
+        return r || "â€”";
+      });
+      rows.push([`Day ${row.day}`, dateStr, row.isStudy ? row.count : "Rev Only", newLecs, ...revCols]);
+    }
+    const ws = XLSX.utils.aoa_to_sheet(rows);
+    ws["!cols"] = [8, 18, 10, 22, ...LABELS.map(() => 18)].map(w => ({ wch: w }));
+    XLSX.utils.book_append_sheet(wb, ws, "Full Schedule");
+
+    // Today sheet
+    if (sched.todayRow) {
+      const t = sched.todayRow;
+      const todayDate = dateForDay(startDate, startDay);
+      const todayDateStr = todayDate ? formatDate(todayDate) : "";
+      const tRows = [
+        [`Today â€” Day ${startDay}  |  ${todayDateStr}`], [""],
+        ["New Lectures"], ...t.lecs.map(n => [getLecName(n)]),
+        [""], ["Revisions Due"], ...t.revisions.map(r => [getLecName(r.ln), r.ivLabel])
+      ];
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(tRows), "Today");
+    }
+
+    XLSX.writeFile(wb, "spaced_rep_schedule.xlsx");
+    showToast("Excel exported! âœ“");
+  };
+
+  // Progress for today
+  const todayDoneCount = sched.todayRow
+    ? [...sched.todayRow.lecs.map(ln => `new-${ln}`),
+       ...sched.todayRow.revisions.map(r => `rev-${sched.todayRow.day}-${r.ln}-${r.iv}`)
+      ].filter(k => done[k]).length
+    : 0;
+  const todayTotal = sched.todayRow
+    ? sched.todayRow.lecs.length + sched.todayRow.revisions.length
+    : 0;
+
+  const navItems = [
+    { id: "today", label: "ðŸ“… Today" },
+    { id: "input", label: "âœï¸ Log Lectures" },
+    { id: "schedule", label: "ðŸ“‹ Full Schedule" },
+    { id: "settings", label: "âš™ï¸ Settings" },
+  ];
+
+  return (
+    <div style={{ fontFamily: "'Inter', system-ui, sans-serif", background: C.bg, minHeight: "100vh", color: C.text }}>
+
+      {/* Toast */}
+      {toast && (
+        <div style={{ position: "fixed", top: 16, right: 16, background: toast.color, color: "#000", padding: "10px 18px", borderRadius: 10, fontWeight: 600, fontSize: 14, zIndex: 999, boxShadow: "0 4px 20px #0006" }}>
+          {toast.msg}
+        </div>
+      )}
+
+      {/* Header */}
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}`, padding: "14px 20px" }}>
+        <div style={{ maxWidth: 860, margin: "0 auto", display: "flex", alignItems: "center", justifyContent: "space-between", flexWrap: "wrap", gap: 10 }}>
+          <div>
+            <div style={{ fontSize: 19, fontWeight: 800, color: C.accent, letterSpacing: "-0.5px" }}>
+              â—ˆ SpaceRep
+            </div>
+            <div style={{ fontSize: 11, color: C.muted, marginTop: 1 }}>Spaced repetition Â· {sched.totalLectures} lectures Â· {sched.planEnd} day plan</div>
+          </div>
+          <button onClick={exportXLSX} style={btnStyle(C.accent, true)}>â¬‡ Export Excel</button>
+        </div>
+      </div>
+
+      {/* Stat bar */}
+      <div style={{ background: C.surface, borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ maxWidth: 860, margin: "0 auto", display: "flex", flexWrap: "wrap" }}>
+          {[
+            ["Current Day", `Day ${startDay}`],
+            ["Date", startDate ? formatDateShort(dateForDay(startDate, startDay)) : "Not set"],
+            ["Total Lectures", sched.totalLectures],
+            ["Study Days", totalDays],
+            ["Plan Ends", startDate ? formatDateShort(dateForDay(startDate, sched.planEnd)) : `Day ${sched.planEnd}`],
+            ["Today Done", todayTotal > 0 ? `${todayDoneCount}/${todayTotal}` : "â€”"],
+          ].map(([l, v]) => (
+            <div key={l} style={{ flex: 1, minWidth: 80, padding: "9px 16px", borderRight: `1px solid ${C.border}` }}>
+              <div style={{ fontSize: 9, color: C.muted, textTransform: "uppercase", letterSpacing: 1 }}>{l}</div>
+              <div style={{ fontSize: 18, fontWeight: 700, color: C.accent, marginTop: 1 }}>{v}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* Nav */}
+      <div style={{ background: C.card, borderBottom: `1px solid ${C.border}` }}>
+        <div style={{ maxWidth: 860, margin: "0 auto", display: "flex", gap: 2, padding: "0 12px" }}>
+          {navItems.map(n => (
+            <button key={n.id} onClick={() => setView(n.id)} style={{
+              padding: "10px 14px", background: "none", border: "none",
+              borderBottom: view === n.id ? `2px solid ${C.accent}` : "2px solid transparent",
+              color: view === n.id ? C.accent : C.muted,
+              fontWeight: view === n.id ? 700 : 400, fontSize: 13, cursor: "pointer",
+            }}>{n.label}</button>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 860, margin: "0 auto", padding: "20px 16px" }}>
+
+        {/* â”€â”€ TODAY VIEW â”€â”€ */}
+        {view === "today" && (
+          <div>
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 16, flexWrap: "wrap", gap: 8 }}>
+              <div>
+                <div style={{ fontSize: 22, fontWeight: 800 }}>Day {startDay} <span style={{ color: C.muted, fontSize: 14, fontWeight: 400 }}>â€” Today's Plan</span></div>
+                {startDate && (
+                  <div style={{ fontSize: 13, color: C.accent, marginTop: 2, fontWeight: 500 }}>
+                    ðŸ“… {formatDate(dateForDay(startDate, startDay))}
+                  </div>
+                )}
+                {todayTotal > 0 && (
+                  <div style={{ marginTop: 6 }}>
+                    <div style={{ background: C.faint, borderRadius: 100, height: 6, width: 220, overflow: "hidden" }}>
+                      <div style={{ background: C.green, height: "100%", width: `${(todayDoneCount / todayTotal) * 100}%`, transition: "width 0.4s", borderRadius: 100 }} />
+                    </div>
+                    <div style={{ fontSize: 11, color: C.muted, marginTop: 4 }}>{todayDoneCount}/{todayTotal} tasks done</div>
+                  </div>
+                )}
+              </div>
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <button onClick={() => setStartDay(d => Math.max(1, d - 1))} style={btnStyle(C.surface)}>â† Prev</button>
+                <span style={{ fontSize: 13, color: C.muted }}>Day</span>
+                <input type="number" min={1} max={sched.planEnd} value={startDay}
+                  onChange={e => setStartDay(Math.max(1, Math.min(sched.planEnd, +e.target.value || 1)))}
+                  style={{ width: 60, ...inputStyle }} />
+                <button onClick={() => setStartDay(d => Math.min(sched.planEnd, d + 1))} style={btnStyle(C.surface)}>Next â†’</button>
+              </div>
+            </div>
+
+            {!sched.todayRow ? (
+              <Callout color={C.muted}>No data for this day.</Callout>
+            ) : sched.todayRow.count === 0 && sched.todayRow.isStudy ? (
+              <Callout color={C.red}>ðŸš« Holiday â€” No lectures or revisions today. Rest up!</Callout>
+            ) : (
+              <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+
+                {/* New Lectures */}
+                {sched.todayRow.lecs.length > 0 && (
+                  <Section title="ðŸ“— New Lectures Today" color={C.green}>
+                    {sched.todayRow.lecs.map(ln => {
+                      const key = `new-${ln}`;
+                      const isDone = !!done[key];
+                      return (
+                        <TaskRow key={ln} done={isDone} color={C.green}
+                          onToggle={() => toggleDone(key)}
+                          label={getLecName(ln)}
+                          sublabel="Learn + same-day review"
+                          onRename={() => setEditingName(ln)}
+                        />
+                      );
+                    })}
+                  </Section>
+                )}
+
+                {/* Revisions */}
+                {sched.todayRow.revisions.length > 0 && (
+                  <Section title="ðŸ” Revisions Due Today" color={C.yellow}>
+                    {sched.todayRow.revisions.map((r, i) => {
+                      const key = `rev-${sched.todayRow.day}-${r.ln}-${r.iv}`;
+                      const isDone = !!done[key];
+                      return (
+                        <TaskRow key={i} done={isDone} color={C.yellow}
+                          onToggle={() => toggleDone(key)}
+                          label={getLecName(r.ln)}
+                          sublabel={`${r.ivLabel} revision Â· Originally from Day ${r.fromDay}`}
+                          onRename={() => setEditingName(r.ln)}
+                        />
+                      );
+                    })}
+                  </Section>
+                )}
+
+                {sched.todayRow.lecs.length === 0 && sched.todayRow.revisions.length === 0 && (
+                  <Callout color={C.muted}>Nothing scheduled for Day {startDay}.</Callout>
+                )}
+              </div>
+            )}
+
+            {/* Rename modal */}
+            {editingName !== null && (
+              <div style={{ position: "fixed", inset: 0, background: "#000a", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 100 }}>
+                <div style={{ background: C.card, border: `1px solid ${C.border}`, borderRadius: 14, padding: 24, width: 320 }}>
+                  <div style={{ fontWeight: 700, marginBottom: 12 }}>Rename Lecture {editingName}</div>
+                  <input autoFocus
+                    defaultValue={lectureNames[editingName] || ""}
+                    onKeyDown={e => {
+                      if (e.key === "Enter") {
+                        setLectureNames(prev => ({ ...prev, [editingName]: e.target.value }));
+                        setEditingName(null);
+                        showToast("Name saved âœ“");
+                      }
+                      if (e.key === "Escape") setEditingName(null);
+                    }}
+                    placeholder={`e.g. "Chapter 3 â€“ Thermodynamics"`}
+                    style={{ width: "100%", ...inputStyle, marginBottom: 12, boxSizing: "border-box" }}
+                  />
+                  <div style={{ fontSize: 12, color: C.muted }}>Press Enter to save, Esc to cancel</div>
+                </div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* â”€â”€ INPUT VIEW â”€â”€ */}
+        {view === "input" && (
+          <div>
+            <div style={{ marginBottom: 16, display: "flex", alignItems: "flex-end", gap: 16, flexWrap: "wrap" }}>
+              <div>
+                <div style={{ fontSize: 12, color: C.muted, marginBottom: 4 }}>Total study days</div>
+                <input type="number" min={1} max={365} value={totalDays}
+                  onChange={e => setTotalDays(Math.max(1, Math.min(365, +e.target.value || 1)))}
+                  style={{ width: 80, ...inputStyle }} />
+              </div>
+              <button onClick={() => { setInputs({}); showToast("Reset to 2 lectures/day"); }} style={btnStyle(C.surface)}>â†º Reset all to 2</button>
+              <button onClick={() => { const o = {}; for (let d = 1; d <= totalDays; d++) o[d] = 1; setInputs(o); showToast("Set all to 1"); }} style={btnStyle(C.surface)}>Set all to 1</button>
+              <button onClick={() => { const o = {}; for (let d = 1; d <= totalDays; d++) o[d] = 0; setInputs(o); showToast("Set all to holiday"); }} style={btnStyle(C.redDim)}>Set all to holiday</button>
+            </div>
+
+            <div style={{ fontSize: 13, color: C.muted, marginBottom: 14 }}>
+              Type lectures per day. <b style={{ color: C.text }}>0 = holiday Â· 1, 2, 3â€¦ = lectures that day.</b> Lecture numbers auto-assign based on order.
+            </div>
+
+            {/* Running lecture counter preview */}
+            <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 10, padding: "10px 14px", marginBottom: 16, fontSize: 13 }}>
+              <span style={{ color: C.muted }}>Lectures assigned so far: </span>
+              <span style={{ color: C.accent, fontWeight: 700 }}>L1 â†’ L{sched.totalLectures}</span>
+              <span style={{ color: C.muted }}> across {totalDays} days</span>
+            </div>
+
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(100px, 1fr))", gap: 8 }}>
+              {Array.from({ length: totalDays }, (_, i) => i + 1).map(day => {
+                const raw = inputs[day] ?? "2";
+                const num = parseInt(raw) || 0;
+                const isHoliday = num === 0;
+                const color = isHoliday ? C.red : num === 1 ? C.yellow : num >= 3 ? C.green : C.accent;
+                const bg = isHoliday ? C.redDim : num === 1 ? C.yellowDim : num >= 3 ? C.greenDim : C.accentDim;
+                // Find which lectures this day gets
+                const dayData = sched.studyDays[day - 1];
+                const lecRange = dayData?.lecs.length
+                  ? `L${dayData.lecs[0]}${dayData.lecs.length > 1 ? `â€“L${dayData.lecs[dayData.lecs.length - 1]}` : ""}`
+                  : "";
+
+                return (
+                  <div key={day} style={{ background: bg + "88", border: `1.5px solid ${color}44`, borderRadius: 10, padding: "8px 6px", textAlign: "center" }}>
+                    <div style={{ fontSize: 10, color: C.muted, marginBottom: 2 }}>Day {day}</div>
+                    <input type="number" min={0} max={10} value={raw}
+                      onChange={e => setInputs(prev => ({ ...prev, [day]: e.target.value }))}
+                      style={{ width: 52, padding: "5px 4px", background: C.bg, border: `1px solid ${color}`, borderRadius: 6, color, fontSize: 18, fontWeight: 700, textAlign: "center" }}
+                    />
+                    <div style={{ fontSize: 9, color, marginTop: 3 }}>
+                      {isHoliday ? "ðŸš« holiday" : `${num} lec${num !== 1 ? "s" : ""}`}
+                    </div>
+                    {lecRange && <div style={{ fontSize: 9, color: C.muted, marginTop: 1 }}>{lecRange}</div>}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* â”€â”€ SCHEDULE VIEW â”€â”€ */}
+        {view === "schedule" && (
+          <div>
+            <div style={{ display: "flex", gap: 10, marginBottom: 14, flexWrap: "wrap", alignItems: "center" }}>
+              <input placeholder="ðŸ” Search lectureâ€¦" value={searchQ}
+                onChange={e => setSearchQ(e.target.value)}
+                style={{ flex: 1, minWidth: 160, ...inputStyle }} />
+              <div style={{ display: "flex", gap: 6 }}>
+                {[["ðŸŸ¢ New", C.green], ["ðŸŸ¡ Revision", C.yellow], ["ðŸ”´ Holiday", C.red], ["â¬› Rev-only day", C.muted]].map(([l, c]) => (
+                  <span key={l} style={{ fontSize: 10, color: c, background: C.surface, padding: "3px 7px", borderRadius: 5, border: `1px solid ${c}33` }}>{l}</span>
+                ))}
+              </div>
+            </div>
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+              {sched.allDays.map(row => {
+                const isHoliday = row.isStudy && row.count === 0;
+                const isToday = row.day === startDay;
+
+                // Filter by search
+                if (searchQ) {
+                  const q = searchQ.toLowerCase();
+                  const matchNew = row.lecs.some(n => getLecName(n).toLowerCase().includes(q) || `l${n}`.includes(q));
+                  const matchRev = row.revisions.some(r => getLecName(r.ln).toLowerCase().includes(q) || `l${r.ln}`.includes(q));
+                  if (!matchNew && !matchRev && !`day ${row.day}`.includes(q)) return null;
+                }
+
+                const borderCol = isToday ? C.accent : isHoliday ? C.red : row.lecs.length > 0 ? C.blueDim : C.border;
+                const bgCol = isToday ? C.accentDim + "55" : isHoliday ? C.redDim : row.isStudy ? C.surface : C.card;
+
+                const revGroups = INTERVALS.map((iv, idx) => ({
+                  label: LABELS[idx], items: row.revisions.filter(r => r.iv === iv)
+                })).filter(g => g.items.length > 0);
+
+                return (
+                  <div key={row.day} style={{ background: bgCol, border: `1px solid ${borderCol}`, borderRadius: 10, padding: "9px 14px", display: "flex", gap: 10, flexWrap: "wrap", alignItems: "center" }}>
+                    <div style={{ minWidth: 80, textAlign: "center" }}>
+                      <div style={{ fontSize: 9, color: C.muted }}>DAY</div>
+                      <div style={{ fontSize: 19, fontWeight: 800, color: isToday ? C.accent : isHoliday ? C.red : row.isStudy ? C.blue : C.muted }}>
+                        {row.day}
+                      </div>
+                      {startDate && (
+                        <div style={{ fontSize: 9, color: isToday ? C.accent : C.muted, marginTop: 1, lineHeight: 1.3 }}>
+                          {formatDateShort(dateForDay(startDate, row.day))}
+                        </div>
+                      )}
+                      {isToday && <div style={{ fontSize: 8, color: C.accent, fontWeight: 700, marginTop: 1 }}>TODAY</div>}
+                    </div>
+
+                    <div style={{ minWidth: 110 }}>
+                      <div style={{ fontSize: 9, color: C.muted, marginBottom: 2 }}>NEW</div>
+                      {isHoliday ? <Tag color={C.red}>ðŸš« Holiday</Tag>
+                        : row.lecs.length > 0 ? row.lecs.map(n => <Tag key={n} color={C.green}>{getLecName(n)}</Tag>)
+                        : <span style={{ color: C.muted, fontSize: 11 }}>â€”</span>}
+                    </div>
+
+                    <div style={{ flex: 1, display: "flex", gap: 5, flexWrap: "wrap" }}>
+                      {revGroups.map(({ label, items }) => (
+                        <div key={label} style={{ background: C.yellowDim, border: `1px solid ${C.yellow}33`, borderRadius: 6, padding: "3px 9px", fontSize: 11 }}>
+                          <span style={{ color: C.yellow, fontWeight: 600 }}>{label}: </span>
+                          <span style={{ color: C.text }}>{items.map(r => getLecName(r.ln)).join(", ")}</span>
+                        </div>
+                      ))}
+                      {revGroups.length === 0 && !isHoliday && row.lecs.length === 0 &&
+                        <span style={{ color: C.faint, fontSize: 11 }}>No tasks</span>}
+                    </div>
+
+                    {row.revisions.length > 0 && (
+                      <div style={{ textAlign: "center", minWidth: 30 }}>
+                        <div style={{ fontSize: 9, color: C.muted }}>revs</div>
+                        <div style={{ fontSize: 15, fontWeight: 700, color: C.yellow }}>{row.revisions.length}</div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {/* â”€â”€ SETTINGS VIEW â”€â”€ */}
+        {view === "settings" && (
+          <div style={{ display: "flex", flexDirection: "column", gap: 14, maxWidth: 500 }}>
+            <div style={{ fontSize: 16, fontWeight: 700 }}>âš™ï¸ Settings</div>
+
+            {/* Start Date */}
+            <SettingCard title="ðŸ“… Start Date" desc="Set the real calendar date when Day 1 of your course began. All other days will get their dates automatically.">
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <input type="date" value={startDate}
+                  onChange={e => setStartDate(e.target.value)}
+                  style={{ ...inputStyle, width: 150 }} />
+                <button onClick={() => { setStartDate(todayYMD()); showToast("Start date set to today âœ“"); }}
+                  style={btnStyle(C.accent, true)}>Set to Today</button>
+              </div>
+              {startDate && (
+                <div style={{ fontSize: 12, color: C.muted, marginTop: 8 }}>
+                  Day 1 = <b style={{ color: C.text }}>{formatDate(new Date(startDate))}</b>
+                  <br />Today = <b style={{ color: C.accent }}>Day {currentDayNum(startDate)}</b> Â· Plan ends on <b style={{ color: C.text }}>{formatDate(dateForDay(startDate, sched.planEnd))}</b>
+                </div>
+              )}
+            </SettingCard>
+
+            {/* Reminder */}
+            <SettingCard title="ðŸ”” Daily Reminder" desc="Get a browser notification with today's revision list.">
+              <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
+                <input type="time" value={notifTime}
+                  onChange={e => setNotifTime(e.target.value)}
+                  style={{ ...inputStyle, width: 110 }} />
+                {notifEnabled
+                  ? <button onClick={() => { setNotifEnabled(false); showToast("Reminders off"); }} style={btnStyle(C.redDim)}>Turn Off</button>
+                  : <button onClick={requestNotif} style={btnStyle(C.accent, true)}>Enable Reminder</button>
+                }
+                {notifEnabled && <span style={{ fontSize: 12, color: C.green }}>âœ“ Active</span>}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 6 }}>
+                Sends a notification at the chosen time each day. Keep this tab open for it to work.
+              </div>
+            </SettingCard>
+
+            {/* Rename lectures */}
+            <SettingCard title="ðŸ·ï¸ Name Your Lectures" desc="Give each lecture a meaningful name (e.g. 'Chapter 3 â€“ Thermodynamics').">
+              <div style={{ display: "flex", flexDirection: "column", gap: 6, maxHeight: 280, overflowY: "auto" }}>
+                {Array.from({ length: sched.totalLectures }, (_, i) => i + 1).map(ln => (
+                  <div key={ln} style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, color: C.muted, minWidth: 20 }}>L{ln}</span>
+                    <input
+                      placeholder={`Lecture ${ln}`}
+                      value={lectureNames[ln] || ""}
+                      onChange={e => setLectureNames(prev => ({ ...prev, [ln]: e.target.value }))}
+                      style={{ flex: 1, ...inputStyle, fontSize: 12, padding: "5px 8px" }}
+                    />
+                  </div>
+                ))}
+              </div>
+              <button onClick={() => showToast("Names saved âœ“")} style={{ ...btnStyle(C.accent, true), marginTop: 8 }}>Save Names</button>
+            </SettingCard>
+
+            {/* Reset */}
+            <SettingCard title="ðŸ—‘ï¸ Reset Data" desc="Clear all progress, names, and lecture counts.">
+              <button onClick={() => {
+                if (confirm("Reset everything?")) {
+                  setInputs({}); setDone({}); setLectureNames({}); setTotalDays(20); setStartDay(1);
+                  showToast("Reset done", C.red);
+                }
+              }} style={btnStyle(C.redDim)}>Reset Everything</button>
+            </SettingCard>
+
+            {/* Interval info */}
+            <SettingCard title="ðŸ“ Revision Intervals" desc="The spaced repetition schedule used for every lecture.">
+              <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                {LABELS.map((l, i) => (
+                  <span key={l} style={{ background: C.yellowDim, border: `1px solid ${C.yellow}33`, borderRadius: 6, padding: "3px 10px", fontSize: 12, color: C.yellow }}>{l}</span>
+                ))}
+              </div>
+              <div style={{ fontSize: 11, color: C.muted, marginTop: 8 }}>8 revision sessions per lecture = permanent long-term memory.</div>
+            </SettingCard>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}
+
+// â”€â”€â”€ Reusable sub-components â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+function Section({ title, color, children }) {
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${color}33`, borderRadius: 12, overflow: "hidden" }}>
+      <div style={{ background: color + "18", padding: "9px 14px", fontSize: 13, fontWeight: 700, color, borderBottom: `1px solid ${color}22` }}>{title}</div>
+      <div style={{ padding: "8px 10px", display: "flex", flexDirection: "column", gap: 6 }}>{children}</div>
+    </div>
+  );
+}
+
+function TaskRow({ done, color, onToggle, label, sublabel, onRename }) {
+  return (
+    <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "7px 10px", background: done ? C.bg : C.card, borderRadius: 8, border: `1px solid ${done ? C.border : color + "33"}`, opacity: done ? 0.5 : 1, transition: "all 0.2s" }}>
+      <button onClick={onToggle} style={{ width: 22, height: 22, borderRadius: 6, border: `2px solid ${color}`, background: done ? color : "transparent", cursor: "pointer", flexShrink: 0, display: "flex", alignItems: "center", justifyContent: "center", color: "#000", fontWeight: 900, fontSize: 13 }}>
+        {done ? "âœ“" : ""}
+      </button>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontSize: 13, fontWeight: 600, textDecoration: done ? "line-through" : "none", color: done ? C.muted : C.text }}>{label}</div>
+        <div style={{ fontSize: 11, color: C.muted }}>{sublabel}</div>
+      </div>
+      <button onClick={onRename} title="Rename" style={{ background: "none", border: "none", color: C.muted, cursor: "pointer", fontSize: 14, padding: "2px 6px", borderRadius: 5 }}>âœï¸</button>
+    </div>
+  );
+}
+
+function Tag({ color, children }) {
+  return (
+    <span style={{ display: "inline-block", background: color + "18", border: `1px solid ${color}44`, borderRadius: 5, padding: "2px 7px", fontSize: 11, color, fontWeight: 600, marginRight: 3, marginBottom: 2 }}>
+      {children}
+    </span>
+  );
+}
+
+function Callout({ color, children }) {
+  return (
+    <div style={{ background: color + "18", border: `1px solid ${color}44`, borderRadius: 10, padding: "14px 18px", color, fontSize: 14 }}>
+      {children}
+    </div>
+  );
+}
+
+function SettingCard({ title, desc, children }) {
+  return (
+    <div style={{ background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12, padding: "14px 16px" }}>
+      <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 3 }}>{title}</div>
+      <div style={{ fontSize: 12, color: C.muted, marginBottom: 10 }}>{desc}</div>
+      {children}
+    </div>
+  );
+}
+
+function btnStyle(bg, filled) {
+  return {
+    padding: "7px 14px", borderRadius: 8, border: `1px solid ${bg}`,
+    background: filled ? bg : "transparent",
+    color: filled ? "#fff" : C.text,
+    cursor: "pointer", fontSize: 13, fontWeight: 600,
+  };
+}
+
+const inputStyle = {
+  padding: "7px 10px", background: C.surface,
+  border: `1px solid ${C.border}`, borderRadius: 8,
+  color: C.text, fontSize: 13, outline: "none",
+};
