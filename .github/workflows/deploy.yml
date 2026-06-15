@@ -28,12 +28,12 @@ jobs:
         run: pnpm install --no-frozen-lockfile
 
       - name: Build
-        run: pnpm --filter @workspace/spacerep run build:github
+        run: cd artifacts/spacerep && pnpm run build:github
 
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: artifacts/spacerep/dist
+          path: ./artifacts/spacerep/dist
 
   deploy:
     needs: build-and-deploy
