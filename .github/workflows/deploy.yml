@@ -33,7 +33,7 @@ jobs:
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          path: spacerep/dist
+          path: artifacts/spacerep/dist
 
   deploy:
     needs: build-and-deploy
